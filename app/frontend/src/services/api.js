@@ -1030,8 +1030,10 @@ export async function generateImage(prompt, negativePrompt, constraints, activeM
       let errMsg = `Generation failed (HTTP ${response.status})`;
       try {
         const errJson = await response.json();
-        if (errJson?.detail || errJson?.error?.message) {
-          errMsg = errJson.detail || errJson.error.message;
+        const detail = errJson?.detail || errJson?.error?.message ||
+          (typeof errJson?.error === "string" ? errJson.error : "");
+        if (detail) {
+          errMsg = `${errMsg}: ${detail}`;
         }
       } catch (_) {}
       throw new Error(errMsg);
