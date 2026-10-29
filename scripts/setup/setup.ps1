@@ -267,22 +267,45 @@ if (-not $hasNvidia) {
     } catch {}
 }
 
-Print-Step 2 $steps "Setting up stable-diffusion.cpp CPU backend (app/backend/win/cpu/)"
-$cpuBackendDest = Join-Path $appDir "backend\win\cpu"
-$cpuBackendExe  = Join-Path $cpuBackendDest "sd-cpu.exe"
-$cpuBackendDll  = Join-Path $cpuBackendDest "stable-diffusion.dll"
+# The default CPU build needs AVX2. Older processors (e.g. Intel 2nd/3rd gen
+# Core) crash with 0xC000001D, so pick the AVX or no-AVX build for them.
+# PF_AVX_INSTRUCTIONS_AVAILABLE = 39, PF_AVX2_INSTRUCTIONS_AVAILABLE = 40.
+# Older Windows builds report false for both: keep AVX2 there (the app
+# switches to a compatible build if the backend crashes).
+$cpuBuild = "avx2"
+try {
+    $cpuFeat = Add-Type -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool IsProcessorFeaturePresent(uint f);' -Name CpuFeat -Namespace Setup -PassThru
+    $hasAvx  = $cpuFeat::IsProcessorFeaturePresent(39)
+    $hasAvx2 = $cpuFeat::IsProcessorFeaturePresent(40)
+    if ($hasAvx -and -not $hasAvx2) { $cpuBuild = "avx" }
+} catch {}
+$cpuPrefFile = Join-Path $appDir "config\cpu-backend.json"
+if (Test-Path $cpuPrefFile) {
+    try {
+        $savedBuild = (Get-Content $cpuPrefFile -Raw | ConvertFrom-Json).build
+        if (@("avx2", "avx", "noavx") -contains $savedBuild) { $cpuBuild = $savedBuild }
+    } catch {}
+}
 
-if ((Test-Path $cpuBackendExe) -and (Test-Path $cpuBackendDll)) {
+Print-Step 2 $steps "Setting up stable-diffusion.cpp CPU backend (app/backend/win/cpu/)"
+$cpuBackendDest  = Join-Path $appDir "backend\win\cpu"
+$cpuBackendExe   = Join-Path $cpuBackendDest "sd-cpu.exe"
+$cpuBackendDll   = Join-Path $cpuBackendDest "stable-diffusion.dll"
+$cpuBuildMarker  = Join-Path $cpuBackendDest "cpu-build.txt"
+$installedBuild  = if (Test-Path $cpuBuildMarker) { (Get-Content $cpuBuildMarker -Raw).Trim() } else { "avx2" }
+
+if ((Test-Path $cpuBackendExe) -and (Test-Path $cpuBackendDll) -and ($installedBuild -eq $cpuBuild -or $cpuBuild -eq "avx2")) {
     Print-OK "CPU backend binaries already ready."
 } else {
+    if ($cpuBuild -ne "avx2") { Print-Info "This CPU does not support AVX2: installing the compatible $($cpuBuild.ToUpper()) build." }
     $cpuBackendZip = Join-Path $toolsDir "sd-cpu.zip"
     New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
     New-Item -ItemType Directory -Force -Path $cpuBackendDest | Out-Null
 
     $ok = Invoke-RichDownload `
-        -Url  "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-721-8caa3f9/sd-master-8caa3f9-bin-win-avx2-x64.zip" `
+        -Url  "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-721-8caa3f9/sd-master-8caa3f9-bin-win-$cpuBuild-x64.zip" `
         -Dest $cpuBackendZip `
-        -Label "stable-diffusion.cpp CPU Backend (Windows x64 AVX2)"
+        -Label "stable-diffusion.cpp CPU Backend (Windows x64 $($cpuBuild.ToUpper()))"
 
     if (-not $ok) { Print-Fail "Cannot download CPU backend binaries."; Read-Host; exit 1 }
 
@@ -310,6 +333,7 @@ if ((Test-Path $cpuBackendExe) -and (Test-Path $cpuBackendDll)) {
     }
 
     if ((Test-Path $cpuBackendExe) -and (Test-Path $cpuBackendDll)) {
+        Set-Content -Path $cpuBuildMarker -Value $cpuBuild -NoNewline
         Print-OK "CPU backend binaries installed successfully!"
     } else {
         Print-Fail "Failed to copy backend binaries to app/backend/win/cpu/."

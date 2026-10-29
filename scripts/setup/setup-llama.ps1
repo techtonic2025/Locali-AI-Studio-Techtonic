@@ -206,7 +206,7 @@ try {
     }
 } catch {}
 if ($hasAmd) {
-    Try-InstallLlamaArchive -Variant "hip" -AssetName "llama-$Release-bin-win-hip-x64.zip" -Reason "AMD HIP acceleration"
+    Try-InstallLlamaArchive -Variant "hip" -AssetName "llama-$Release-bin-win-hip-radeon-x64.zip" -Reason "AMD HIP acceleration"
 }
 # Intel Arc/Graphics detection for SYCL backend
 $hasIntel = $false

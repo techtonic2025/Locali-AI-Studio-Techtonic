@@ -556,6 +556,41 @@ function hasVulkanRuntime() {
   return false;
 }
 
+// Windows: ask the kernel which vector instruction sets the CPU supports.
+// The default stable-diffusion.cpp CPU build needs AVX2; older CPUs (for
+// example 3rd-gen Core i5) crash with 0xC000001D (illegal instruction).
+// PF_AVX_INSTRUCTIONS_AVAILABLE = 39, PF_AVX2_INSTRUCTIONS_AVAILABLE = 40.
+// Older Windows builds do not know these flags and report false for both,
+// so "known: false" means "could not tell" rather than "no AVX".
+let cachedCpuFeatures = null;
+function getWindowsCpuFeatures() {
+  if (cachedCpuFeatures) return cachedCpuFeatures;
+  cachedCpuFeatures = { avx: true, avx2: true, known: false };
+  if (osPlatform !== "win32") return cachedCpuFeatures;
+  try {
+    const script = [
+      "$sig = '[DllImport(\"kernel32.dll\")] public static extern bool IsProcessorFeaturePresent(uint f);'",
+      "$k = Add-Type -MemberDefinition $sig -Name CpuFeat -Namespace Studio -PassThru",
+      "Write-Output (\"{0},{1}\" -f [int]$k::IsProcessorFeaturePresent(39), [int]$k::IsProcessorFeaturePresent(40))",
+    ].join("; ");
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    const out = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], {
+      encoding: "utf8",
+      timeout: 15000,
+      windowsHide: true,
+    });
+    const match = String(out.stdout || "").match(/([01]),([01])/);
+    if (match) {
+      const avx = match[1] === "1";
+      const avx2 = match[2] === "1";
+      if (avx || avx2) {
+        cachedCpuFeatures = { avx: avx || avx2, avx2, known: true };
+      }
+    }
+  } catch (_) {}
+  return cachedCpuFeatures;
+}
+
 function detectLinuxGpuFromSysfs() {
   try {
     const pciDir = "/sys/bus/pci/devices";
@@ -3078,8 +3113,9 @@ function getBackendOptions() {
   );
   const rocmInstalled = osPlatform === "linux" && fs.existsSync(BACKEND_PATHS.linuxRocm);
   const rocmAvailable = rocmInstalled && hasAmdGpu() && backendAccepts(BACKEND_PATHS.linuxRocm, "rocm");
+  const cpuNeedsCompatibleBuild = cpuBuildNeedsReplacement();
   const cpuInstalled = (osPlatform === "linux" && fs.existsSync(BACKEND_PATHS.linuxCpu)) ||
-                        (osPlatform === "win32" && fs.existsSync(BACKEND_PATHS.cpu));
+                        (osPlatform === "win32" && fs.existsSync(BACKEND_PATHS.cpu) && !cpuNeedsCompatibleBuild);
   const metalInstalled = osPlatform === "darwin" && fs.existsSync(BACKEND_PATHS.mac);
   const metalAvailable = metalInstalled;
   const coremlNpu = getCoreMLNpuInfo();
@@ -3112,7 +3148,13 @@ function getBackendOptions() {
   if (coremlNpu.supported && !coremlNpu.ready) {
     unavailable.push({ id: "apple-npu", label: "Apple Neural Engine (NPU)", reason: coremlNpu.reason });
   }
-  if (!cpuInstalled && (osPlatform === "win32" || osPlatform === "linux")) {
+  if (cpuNeedsCompatibleBuild) {
+    unavailable.push({
+      id: "cpu",
+      label: "CPU",
+      reason: `The installed CPU backend needs AVX2, which this processor does not support. Download the compatible build (${getPreferredCpuBuild().toUpperCase()}).`,
+    });
+  } else if (!cpuInstalled && (osPlatform === "win32" || osPlatform === "linux")) {
     unavailable.push({
       id: "cpu",
       label: "CPU",
@@ -3370,7 +3412,11 @@ function proxyImageBackendRequest(req, res) {
     path: req.url,
     method: req.method,
     headers,
-    timeout: 300000,
+    // No idle timeout: stable-diffusion.cpp sends nothing until the image is
+    // done, and on CPU or with large models a single image can take far longer
+    // than a few minutes. A fixed timeout here turned slow generations into
+    // "HTTP 502" right at the end (VAE decode at 99%).
+    timeout: 0,
   }, (proxyRes) => {
     res.writeHead(proxyRes.statusCode || 502, {
       ...proxyRes.headers,
@@ -3380,10 +3426,21 @@ function proxyImageBackendRequest(req, res) {
   });
 
   proxyReq.on("error", (err) => {
-    json(res, 502, { ok: false, error: `Image backend is not reachable: ${err.message}` });
-  });
-  proxyReq.on("timeout", () => {
-    proxyReq.destroy(new Error("Image backend request timed out"));
+    // If the backend died mid-generation, its exit handler fills backendError
+    // shortly after the socket closes; wait a moment so the user sees the real cause.
+    setTimeout(() => {
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      let error = `Image backend is not reachable: ${err.message}`;
+      if (!backendProc) {
+        error = backendError
+          ? `The image backend stopped during generation: ${backendError}`
+          : "The image backend is not running. Load the image model again; if it stops during generation, the GPU or system probably ran out of memory: try a smaller resolution and keep VAE tiling enabled.";
+      }
+      json(res, 502, { ok: false, error });
+    }, 1500);
   });
 
   req.pipe(proxyReq);
@@ -4326,7 +4383,9 @@ async function startLlmWithBackend(settings = {}, backend) {
     }
     llmReady = false;
     llmProc = null;
-    if (code !== 0 && code !== null && !llmError) llmError = `llama.cpp exited with code ${code}`;
+    if (osPlatform === "win32" && Number(code) === 3221225501) {
+      llmError = `llama.cpp exited with code ${code} (0xC000001D: illegal instruction). This processor does not support the instructions used by the ${backend.mode || backend.key} text backend. Choose CPU as the text backend in Settings and load the model again.`;
+    } else if (code !== 0 && code !== null && !llmError) llmError = `llama.cpp exited with code ${code}`;
     console.log("  [llm] exited with code", code, `(process ${procSeq})`);
   });
 
@@ -4722,11 +4781,60 @@ function startOpenVinoModelDownload(modelId) {
   });
 }
 
+const SD_CPU_BUILD_URLS = {
+  avx2: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-721-8caa3f9/sd-master-8caa3f9-bin-win-avx2-x64.zip",
+  avx: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-721-8caa3f9/sd-master-8caa3f9-bin-win-avx-x64.zip",
+  noavx: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-721-8caa3f9/sd-master-8caa3f9-bin-win-noavx-x64.zip",
+};
+const SD_CPU_BUILD_ORDER = ["avx2", "avx", "noavx"];
+const SD_CPU_BUILD_MARKER = path.join(ROOT, "app", "backend", "win", "cpu", "cpu-build.txt");
+const SD_CPU_PREFERENCE_PATH = path.join(ROOT, "app", "config", "cpu-backend.json");
+
+// Which CPU build is installed. Installs made before the marker existed used AVX2.
+function getInstalledCpuBuild() {
+  try {
+    const value = fs.readFileSync(SD_CPU_BUILD_MARKER, "utf8").trim().toLowerCase();
+    if (SD_CPU_BUILD_URLS[value]) return value;
+  } catch (_) {}
+  return fs.existsSync(BACKEND_PATHS.cpu) ? "avx2" : "";
+}
+
+function getPreferredCpuBuild() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(SD_CPU_PREFERENCE_PATH, "utf8"));
+    if (SD_CPU_BUILD_URLS[saved?.build]) return saved.build;
+  } catch (_) {}
+  const features = getWindowsCpuFeatures();
+  if (!features.known || features.avx2) return "avx2";
+  return features.avx ? "avx" : "noavx";
+}
+
+// Called when a backend crashed with an illegal instruction: remember to use
+// the next, more compatible CPU build the next time the CPU backend is installed.
+function downgradePreferredCpuBuild() {
+  const current = getInstalledCpuBuild() || getPreferredCpuBuild();
+  const next = SD_CPU_BUILD_ORDER[Math.min(SD_CPU_BUILD_ORDER.indexOf(current) + 1, SD_CPU_BUILD_ORDER.length - 1)];
+  try {
+    fs.mkdirSync(path.dirname(SD_CPU_PREFERENCE_PATH), { recursive: true });
+    fs.writeFileSync(SD_CPU_PREFERENCE_PATH, JSON.stringify({ build: next }, null, 2));
+  } catch (_) {}
+  cachedBackendOptions = null;
+  return next;
+}
+
+function cpuBuildNeedsReplacement() {
+  if (osPlatform !== "win32" || !fs.existsSync(BACKEND_PATHS.cpu)) return false;
+  const installed = getInstalledCpuBuild();
+  const preferred = getPreferredCpuBuild();
+  return SD_CPU_BUILD_ORDER.indexOf(installed) < SD_CPU_BUILD_ORDER.indexOf(preferred);
+}
+
 const IMAGE_BACKEND_DOWNLOADS = {
   "cpu": {
     id: "cpu",
     label: "CPU",
-    url: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-721-8caa3f9/sd-master-8caa3f9-bin-win-avx2-x64.zip",
+    get url() { return SD_CPU_BUILD_URLS[getPreferredCpuBuild()]; },
+    get build() { return getPreferredCpuBuild(); },
     destDir: path.join(ROOT, "app", "backend", "win", "cpu"),
     exeName: "sd-cpu.exe",
     requiredDll: "stable-diffusion.dll",
@@ -4743,6 +4851,8 @@ const IMAGE_BACKEND_DOWNLOADS = {
     id: "cuda",
     label: "CUDA GPU",
     url: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-721-8caa3f9/sd-master-8caa3f9-bin-win-cuda12-x64.zip",
+    // The CUDA build does not ship cudart/cublas DLLs; they come from a separate archive.
+    runtimeUrl: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-721-8caa3f9/cudart-sd-bin-win-cu12-x64.zip",
     destDir: path.join(ROOT, "app", "backend", "win", "cuda"),
     exeName: "sd-cuda.exe",
     requiredDll: "stable-diffusion.dll",
@@ -4763,6 +4873,72 @@ function listFilesRecursive(dir) {
   return out;
 }
 
+// Extract a zip on Windows. tar.exe fails with "Can't restore time: Invalid
+// argument" on some file systems (USB sticks, exFAT, synced folders) when it
+// tries to copy file dates, so -m skips that. If tar still fails, fall back
+// to PowerShell's Expand-Archive.
+function extractZipArchive(zipPath, destDir) {
+  const tar = spawnSync("tar.exe", ["-xmf", zipPath, "-C", destDir], { encoding: "utf8", windowsHide: true });
+  if (tar.status === 0) return;
+  const tarError = (tar.stderr || tar.stdout || (tar.error && tar.error.message) || "").trim();
+  console.warn("  [backend-download] tar.exe failed, retrying with Expand-Archive:", tarError);
+
+  const quote = (value) => `'${String(value).replace(/'/g, "''")}'`;
+  const script = `$ProgressPreference = 'SilentlyContinue'; Expand-Archive -LiteralPath ${quote(zipPath)} -DestinationPath ${quote(destDir)} -Force`;
+  const ps = spawnSync("powershell.exe", [
+    "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64"),
+  ], { encoding: "utf8", windowsHide: true });
+  if (ps.status !== 0) {
+    const psError = (ps.stderr || ps.stdout || "").trim();
+    throw new Error(psError || tarError || "Could not extract backend archive.");
+  }
+}
+
+function downloadToFile(url, destPath, redirectCount = 0) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith("https") ? https : http;
+    const request = client.get(url, {
+      headers: { "User-Agent": "Uncensored-AI-Studio/1.0", "Accept": "application/zip, application/octet-stream, */*" },
+    }, (response) => {
+      if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
+        response.resume();
+        if (redirectCount > 10) return reject(new Error("Too many redirects."));
+        resolve(downloadToFile(new URL(response.headers.location, url).toString(), destPath, redirectCount + 1));
+        return;
+      }
+      if (response.statusCode !== 200) {
+        response.resume();
+        reject(new Error(describeDownloadHttpError(response.statusCode, url, response.headers)));
+        return;
+      }
+      const fileStream = fs.createWriteStream(destPath);
+      response.pipe(fileStream);
+      fileStream.on("finish", () => fileStream.close(() => resolve(destPath)));
+      fileStream.on("error", reject);
+      response.on("error", reject);
+    });
+    request.on("error", reject);
+  });
+}
+
+async function installImageBackendRuntime(backend) {
+  if (!backend.runtimeUrl) return;
+  const zipPath = path.join(TOOLS, `${backend.id}-runtime.zip`);
+  const tempDir = path.join(TOOLS, `image-backend-${backend.id}-runtime-${Date.now()}`);
+  try {
+    await downloadToFile(backend.runtimeUrl, zipPath);
+    fs.mkdirSync(tempDir, { recursive: true });
+    extractZipArchive(zipPath, tempDir);
+    for (const file of listFilesRecursive(tempDir)) {
+      if (path.extname(file).toLowerCase() !== ".dll") continue;
+      fs.copyFileSync(file, path.join(backend.destDir, path.basename(file)));
+    }
+  } finally {
+    try { fs.unlinkSync(zipPath); } catch (_) {}
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
+  }
+}
+
 function installImageBackendArchive(zipPath, backend) {
   const tempDir = path.join(TOOLS, `image-backend-${backend.id}-extract-${Date.now()}`);
   try {
@@ -4770,10 +4946,7 @@ function installImageBackendArchive(zipPath, backend) {
     fs.mkdirSync(tempDir, { recursive: true });
     fs.mkdirSync(backend.destDir, { recursive: true });
 
-    const tar = spawnSync("tar.exe", ["-xf", zipPath, "-C", tempDir], { encoding: "utf8" });
-    if (tar.status !== 0) {
-      throw new Error((tar.stderr || tar.stdout || "Could not extract backend archive.").trim());
-    }
+    extractZipArchive(zipPath, tempDir);
 
     const files = listFilesRecursive(tempDir);
     const exeSource = files.find((file) => ["sd-server.exe", "sd.exe"].includes(path.basename(file).toLowerCase()));
@@ -4793,6 +4966,9 @@ function installImageBackendArchive(zipPath, backend) {
 
     if (!fs.existsSync(path.join(backend.destDir, backend.exeName)) || !fs.existsSync(path.join(backend.destDir, backend.requiredDll))) {
       throw new Error(`Backend install did not create ${backend.exeName} and ${backend.requiredDll}.`);
+    }
+    if (backend.build) {
+      fs.writeFileSync(path.join(backend.destDir, "cpu-build.txt"), backend.build);
     }
     cachedBackendOptions = null;
   } finally {
@@ -4910,7 +5086,7 @@ function startImageBackendDownload(backendId, redirectCount = 0, redirectUrl = "
         failDownload(`Download incomplete for ${backend.label}: received ${formatBytes(downloadedBytes)} of ${formatBytes(totalBytes)}.`);
         return;
       }
-      fileStream.end(() => {
+      fileStream.end(async () => {
         try {
           try { fs.unlinkSync(destPath); } catch (_) {}
           fs.renameSync(tempPath, destPath);
@@ -4918,6 +5094,11 @@ function startImageBackendDownload(backendId, redirectCount = 0, redirectUrl = "
           downloadState.progress = 95;
           installImageBackendArchive(destPath, backend);
           try { fs.unlinkSync(destPath); } catch (_) {}
+          if (backend.runtimeUrl) {
+            downloadState.speed = "Installing runtime DLLs";
+            await installImageBackendRuntime(backend);
+            cachedBackendOptions = null;
+          }
           downloadFinalized = true;
           downloadState.active = false;
           downloadState.progress = 100;
@@ -5371,6 +5552,13 @@ function describeBackendExitCode(code, backendPath) {
         : "Update the GPU driver, then run setup again so the backend folder is repaired.";
 
     return `exited with code ${code} (0xC0000135: required DLL not found).\n\nWindows could not start ${backendName} because ${likelyMissing} is missing or not loadable. ${driverHint}\n\nIf you are using an AMD/Intel GPU, update the AMD/Intel graphics driver first. If the GPU is too old for the current Vulkan backend, switch the backend to CPU.`;
+  }
+
+  // 0xC000001D: STATUS_ILLEGAL_INSTRUCTION. The prebuilt backends use AVX2,
+  // which older processors (e.g. Intel 2nd/3rd gen Core) do not have.
+  if (osPlatform === "win32" && numericCode === 3221225501) {
+    const nextBuild = downgradePreferredCpuBuild();
+    return `exited with code ${code} (0xC000001D: illegal instruction).\n\nThis processor does not support the instructions (AVX2) used by the installed image backend. Open Settings > Image Generation > Accelerator and download the compatible CPU backend (${nextBuild.toUpperCase()}), then load the model again with the CPU accelerator.`;
   }
 
   return `exited with code ${code}`;
@@ -7025,6 +7213,7 @@ async function getLlmfitRecommendations(useCase = "chat", limit = 10) {
 });
 
 server.timeout = 0; // Disable socket timeout for large model uploads/downloads
+server.requestTimeout = 0; // Node 18+ otherwise aborts requests (e.g. model imports) after 5 minutes
 
 server.listen(PORT_FRONTEND, "0.0.0.0", () => {
   console.log("");
@@ -7041,6 +7230,12 @@ server.listen(PORT_FRONTEND, "0.0.0.0", () => {
 
   // Do not auto-start backend; wait for selection from the Web UI
   console.log("  [backend] Ready. Waiting for model load request from the webapp...");
+
+  // windows.bat sets OPEN_BROWSER=1: open the UI only now that the server is
+  // listening, instead of after a fixed delay that slow USB drives can miss.
+  if (process.env.OPEN_BROWSER === "1" && osPlatform === "win32") {
+    exec(`start "" "http://localhost:${PORT_FRONTEND}"`, { windowsHide: true }, () => {});
+  }
 });
 
 // Graceful shutdown

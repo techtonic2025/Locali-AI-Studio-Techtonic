@@ -5,7 +5,7 @@
     "cuda": "llama-{release}-bin-win-cuda-12.4-x64.zip",
     "vulkan": "llama-{release}-bin-win-vulkan-x64.zip",
     "sycl": "llama-{release}-bin-win-sycl-x64.zip",
-    "hip": "llama-{release}-bin-win-hip-x64.zip",
+    "hip": "llama-{release}-bin-win-hip-radeon-x64.zip",
     "cpu": "llama-{release}-bin-win-cpu-x64.zip",
     "cudaRuntime": "cudart-llama-bin-win-cuda-12.4-x64.zip"
   },

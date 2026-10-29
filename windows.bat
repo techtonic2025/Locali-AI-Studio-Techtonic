@@ -100,10 +100,18 @@ for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr ":%FRONTEND_PORT% "') 
 for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr ":8080 "') do taskkill /f /pid %%a >nul 2>nul
 for /f "tokens=5" %%a in ('netstat -aon 2^>nul ^| findstr ":%LLM_PORT% "') do taskkill /f /pid %%a >nul 2>nul
 
-:: Start frontend server + backend manager (serve.cjs manages sd-vulkan.exe)
+:: Desktop shortcut so the app can be reopened after this window is closed
+set SHORTCUT=%USERPROFILE%\Desktop\Uncensored AI Studio.lnk
+if not exist "%SHORTCUT%" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:SHORTCUT); $s.TargetPath='%~f0'; $s.WorkingDirectory='%~dp0'; $s.Description='Avvia Uncensored AI Studio'; $s.Save()" >nul 2>nul
+    if exist "%SHORTCUT%" echo  Created desktop shortcut: Uncensored AI Studio
+)
+
+:: Start frontend server + backend manager (serve.cjs manages sd-vulkan.exe).
+:: serve.cjs opens the browser itself once it is listening, so slow USB drives
+:: no longer show "localhost not found" on first open.
 echo  Starting Uncensored AI Studio...
-echo  Opening browser at http://localhost:%FRONTEND_PORT%...
-start /b cmd /c "timeout /t 2 >nul && start http://localhost:%FRONTEND_PORT%"
+set OPEN_BROWSER=1
 
 echo.
 echo  ============================================================
@@ -113,6 +121,11 @@ echo   GPU API:    Auto-selected by the app (starts at 8080)
 echo   Text API:   Starts when a GGUF model is loaded (port %LLM_PORT%)
 echo   Speech:     Managed locally by the app
 echo   TTS:        Managed locally by the app
+echo.
+echo   KEEP THIS WINDOW OPEN while you use the app.
+echo   Closing it stops the app and the browser will show
+echo   "localhost not found". To open the app again, double-click
+echo   windows.bat or the "Uncensored AI Studio" desktop shortcut.
 echo.
 echo   Press Ctrl+C in this window to stop all services.
 echo  ============================================================
